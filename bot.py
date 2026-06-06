@@ -9,13 +9,15 @@ import uvicorn
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 # --- НАСТРОЙКА DISCORD БОТА ---
+# Включаем intents для работы с пользователями на сервере
 intents = discord.Intents.default()
+intents.members = True  # КРИТИЧЕСКИ ВАЖНО: разрешает боту видеть роли участников
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # --- НАСТРОЙКА FASTAPI (API) ---
 app = FastAPI(title="RKKA Bot API")
 
-# Подключение к БД
 def get_db():
     conn = sqlite3.connect("rkka.db")
     return conn
@@ -36,18 +38,6 @@ CREATE TABLE IF NOT EXISTS users(
 conn.commit()
 conn.close()
 
-RANKS = {
-    0: "Красноармеец", 2: "Ефрейтор", 4: "Сержант", 
-    8: "Старшина", 16: "Старший лейтенант", 32: "Капитан", 64: "Полковник"
-}
-
-def get_rank(service):
-    rank = "Красноармеец"
-    for req, name in sorted(RANKS.items()):
-        if service >= req:
-            rank = name
-    return rank
-
 def get_user_db(uid):
     conn = get_db()
     cursor = conn.cursor()
@@ -56,49 +46,31 @@ def get_user_db(uid):
     conn.close()
     return user
 
+# Функция для получения названия роли/ролей пользователя в Discord
+def get_user_roles_str(member: discord.Member):
+    if not isinstance(member, discord.Member):
+        return "Не на сервере"
+    
+    # Фильтруем роль @everyone (она есть у всех)
+    roles = [role.name for role in member.roles if role.name != "@everyone"]
+    
+    if not roles:
+        return "Нет ролей"
+    
+    # Вариант 1: Показывает самую высокую роль по иерархии Дискорда
+    return member.top_role.name
+    
+    # Вариант 2: Если хочешь показывать ВСЕ роли через запятую, 
+    # закомментируй строку выше (поставь # перед return member.top_role.name) 
+    # и раскомментируй строку ниже (убери # перед return):
+    # return ", ".join(roles)
+
+
 # --- МАРШРУТЫ API (ENDPOINTS) ---
 
 @app.get("/")
 def read_root():
     return {"status": "online", "message": "RKKA API работает"}
-
-@app.get("/users")
-def get_all_users():
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, rp_name, game_nick, service FROM users")
-    rows = cursor.fetchall()
-    conn.close()
-    
-    users_list = []
-    for row in rows:
-        users_list.append({
-            "user_id": row[0],
-            "rp_name": row[1],
-            "game_nick": row[2],
-            "service": row[3],
-            "rank": get_rank(row[3])
-        })
-    return {"users": users_list}
-
-# Схема данных для отправки POST-запроса в API
-class ServiceUpdate(BaseModel):
-    user_id: int
-    amount: int
-
-@app.post("/add_service")
-def api_add_service(data: ServiceUpdate):
-    user = get_user_db(data.user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="Пользователь не найден")
-    
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET service = service + ? WHERE user_id=?", (data.amount, data.user_id))
-    conn.commit()
-    conn.close()
-    return {"status": "success", "message": f"Добавлено {data.amount} выслуги пользователю {data.user_id}"}
-
 
 # --- КОМАНДЫ ДИСКОРД БОТА ---
 
@@ -138,19 +110,56 @@ async def stats(interaction: discord.Interaction):
     embed.set_thumbnail(url=interaction.user.display_avatar.url)
     embed.add_field(name="RP Имя", value=user[2], inline=False)
     embed.add_field(name="Игровой ник", value=user[3], inline=False)
-    embed.add_field(name="Выслуга", value=str(user[4]))
-    embed.add_field(name="Звание", value=get_rank(user[4]))
+    embed.add_field(name="Выслуга", value=str(user[4]), inline=True)
+    
+    # Получаем актуальную роль из Дискорда в реальном времени
+    current_role = get_user_roles_str(interaction.user)
+    embed.add_field(name="Звание (Роль)", value=current_role, inline=True)
+    
     await interaction.response.send_message(embed=embed)
 
-# --- ЗАПУСК БОТА И API ОДНОВРЕМЕННО ---
+@bot.tree.command(name="up", description="Получить 1 очко выслуги")
+async def up(interaction: discord.Interaction):
+    user = get_user_db(interaction.user.id)
+    if not user:
+        await interaction.response.send_message("Сначала используйте /reg", ephemeral=True)
+        return
 
+    now = int(time.time())
+    last_up = user[5]
+    cooldown = 43200
+
+    if now - last_up < cooldown:
+        left = cooldown - (now - last_up)
+        h = left // 3600
+        m = (left % 3600) // 60
+        await interaction.response.send_message(
+            f"Следующая выслуга через {h}ч {m}м",
+            ephemeral=True
+        )
+        return
+
+    service = user[4] + 1
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE users SET service=?, last_up=? WHERE user_id=?",
+        (service, now, interaction.user.id)
+    )
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(
+        f"Вы получили 1 очко выслуги. Всего: {service}"
+    )
+
+# --- ЗАПУСК БОТА И API ОДНОВРЕМЕННО ---
 async def main():
-    # Запускаем веб-сервер API на порту, который выдаст Railway (по умолчанию 8080)
     port = int(os.getenv("PORT", 8080))
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)
     
-    # Создаем параллельные задачи для бота и для API сервера
     await asyncio.gather(
         server.serve(),
         bot.start(TOKEN)
