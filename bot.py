@@ -9,9 +9,9 @@ import uvicorn
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 # --- НАСТРОЙКА DISCORD БОТА ---
-# Включаем intents для работы с пользователями на сервере
+# Используем полностью стандартные интенты БЕЗ привилегированных прав.
+# Это на 100% уберет ошибку PrivilegedIntentsRequired!
 intents = discord.Intents.default()
-intents.members = True  # КРИТИЧЕСКИ ВАЖНО: разрешает боту видеть роли участников
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -46,24 +46,24 @@ def get_user_db(uid):
     conn.close()
     return user
 
-# Функция для получения названия роли/ролей пользователя в Discord
-def get_user_roles_str(member: discord.Member):
-    if not isinstance(member, discord.Member):
+# Функция для безопасного получения роли из взаимодействия (Interaction)
+def get_interaction_roles_str(interaction: discord.Interaction):
+    # Проверяем, что команда вызвана на сервере, а не в ЛС
+    if not interaction.guild or not interaction.user:
         return "Не на сервере"
     
-    # Фильтруем роль @everyone (она есть у всех)
+    # Так как при вызове слэш-команды Дискорд сам передает нам объект пользователя со всеми его ролями,
+    # мы можем прочитать их напрямую из interaction.user без включения Members Intent!
+    member = interaction.user
+    
+    # Фильтруем роль @everyone
     roles = [role.name for role in member.roles if role.name != "@everyone"]
     
     if not roles:
         return "Нет ролей"
     
-    # Вариант 1: Показывает самую высокую роль по иерархии Дискорда
+    # Показываем самую высокую по иерархии роль
     return member.top_role.name
-    
-    # Вариант 2: Если хочешь показывать ВСЕ роли через запятую, 
-    # закомментируй строку выше (поставь # перед return member.top_role.name) 
-    # и раскомментируй строку ниже (убери # перед return):
-    # return ", ".join(roles)
 
 
 # --- МАРШРУТЫ API (ENDPOINTS) ---
@@ -71,6 +71,7 @@ def get_user_roles_str(member: discord.Member):
 @app.get("/")
 def read_root():
     return {"status": "online", "message": "RKKA API работает"}
+
 
 # --- КОМАНДЫ ДИСКОРД БОТА ---
 
@@ -112,8 +113,8 @@ async def stats(interaction: discord.Interaction):
     embed.add_field(name="Игровой ник", value=user[3], inline=False)
     embed.add_field(name="Выслуга", value=str(user[4]), inline=True)
     
-    # Получаем актуальную роль из Дискорда в реальном времени
-    current_role = get_user_roles_str(interaction.user)
+    # Извлекаем роль прямо из контекста команды
+    current_role = get_interaction_roles_str(interaction)
     embed.add_field(name="Звание (Роль)", value=current_role, inline=True)
     
     await interaction.response.send_message(embed=embed)
