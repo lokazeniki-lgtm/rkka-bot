@@ -1,16 +1,28 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-import sqlite3, time, os
+import sqlite3, time, os, asyncio
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import uvicorn
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
+# --- НАСТРОЙКА DISCORD БОТА ---
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-conn = sqlite3.connect("rkka.db")
-cursor = conn.cursor()
+# --- НАСТРОЙКА FASTAPI (API) ---
+app = FastAPI(title="RKKA Bot API")
 
+# Подключение к БД
+def get_db():
+    conn = sqlite3.connect("rkka.db")
+    return conn
+
+# Инициализация БД
+conn = get_db()
+cursor = conn.cursor()
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users(
     user_id INTEGER PRIMARY KEY,
@@ -22,15 +34,11 @@ CREATE TABLE IF NOT EXISTS users(
 )
 """)
 conn.commit()
+conn.close()
 
 RANKS = {
-    0: "Красноармеец",
-    2: "Ефрейтор",
-    4: "Сержант",
-    8: "Старшина",
-    16: "Старший лейтенант",
-    32: "Капитан",
-    64: "Полковник"
+    0: "Красноармеец", 2: "Ефрейтор", 4: "Сержант", 
+    8: "Старшина", 16: "Старший лейтенант", 32: "Капитан", 64: "Полковник"
 }
 
 def get_rank(service):
@@ -40,9 +48,59 @@ def get_rank(service):
             rank = name
     return rank
 
-def get_user(uid):
+def get_user_db(uid):
+    conn = get_db()
+    cursor = conn.cursor()
     cursor.execute("SELECT * FROM users WHERE user_id=?", (uid,))
-    return cursor.fetchone()
+    user = cursor.fetchone()
+    conn.close()
+    return user
+
+# --- МАРШРУТЫ API (ENDPOINTS) ---
+
+@app.get("/")
+def read_root():
+    return {"status": "online", "message": "RKKA API работает"}
+
+@app.get("/users")
+def get_all_users():
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, rp_name, game_nick, service FROM users")
+    rows = cursor.fetchall()
+    conn.close()
+    
+    users_list = []
+    for row in rows:
+        users_list.append({
+            "user_id": row[0],
+            "rp_name": row[1],
+            "game_nick": row[2],
+            "service": row[3],
+            "rank": get_rank(row[3])
+        })
+    return {"users": users_list}
+
+# Схема данных для отправки POST-запроса в API
+class ServiceUpdate(BaseModel):
+    user_id: int
+    amount: int
+
+@app.post("/add_service")
+def api_add_service(data: ServiceUpdate):
+    user = get_user_db(data.user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET service = service + ? WHERE user_id=?", (data.amount, data.user_id))
+    conn.commit()
+    conn.close()
+    return {"status": "success", "message": f"Добавлено {data.amount} выслуги пользователю {data.user_id}"}
+
+
+# --- КОМАНДЫ ДИСКОРД БОТА ---
 
 @bot.event
 async def on_ready():
@@ -51,15 +109,18 @@ async def on_ready():
 
 @bot.tree.command(name="reg", description="Регистрация")
 async def reg(interaction: discord.Interaction, rp_name: str, game_nick: str):
-    if get_user(interaction.user.id):
+    if get_user_db(interaction.user.id):
         await interaction.response.send_message("Вы уже зарегистрированы.", ephemeral=True)
         return
 
+    conn = get_db()
+    cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO users(user_id,discord_name,rp_name,game_nick) VALUES(?,?,?,?)",
         (interaction.user.id, str(interaction.user), rp_name, game_nick)
     )
     conn.commit()
+    conn.close()
 
     embed = discord.Embed(title="Регистрация завершена")
     embed.add_field(name="RP Имя", value=rp_name, inline=False)
@@ -68,7 +129,7 @@ async def reg(interaction: discord.Interaction, rp_name: str, game_nick: str):
 
 @bot.tree.command(name="stats", description="Статистика")
 async def stats(interaction: discord.Interaction):
-    user = get_user(interaction.user.id)
+    user = get_user_db(interaction.user.id)
     if not user:
         await interaction.response.send_message("Сначала используйте /reg", ephemeral=True)
         return
@@ -81,92 +142,19 @@ async def stats(interaction: discord.Interaction):
     embed.add_field(name="Звание", value=get_rank(user[4]))
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="up", description="Получить 1 очко выслуги")
-async def up(interaction: discord.Interaction):
-    user = get_user(interaction.user.id)
-    if not user:
-        await interaction.response.send_message("Сначала используйте /reg", ephemeral=True)
-        return
+# --- ЗАПУСК БОТА И API ОДНОВРЕМЕННО ---
 
-    now = int(time.time())
-    last_up = user[5]
-    cooldown = 43200
-
-    if now - last_up < cooldown:
-        left = cooldown - (now - last_up)
-        h = left // 3600
-        m = (left % 3600) // 60
-        await interaction.response.send_message(
-            f"Следующая выслуга через {h}ч {m}м",
-            ephemeral=True
-        )
-        return
-
-    service = user[4] + 1
-
-    cursor.execute(
-        "UPDATE users SET service=?, last_up=? WHERE user_id=?",
-        (service, now, interaction.user.id)
-    )
-    conn.commit()
-
-    await interaction.response.send_message(
-        f"Вы получили 1 очко выслуги. Всего: {service}"
+async def main():
+    # Запускаем веб-сервер API на порту, который выдаст Railway (по умолчанию 8080)
+    port = int(os.getenv("PORT", 8080))
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    server = uvicorn.Server(config)
+    
+    # Создаем параллельные задачи для бота и для API сервера
+    await asyncio.gather(
+        server.serve(),
+        bot.start(TOKEN)
     )
 
-@bot.tree.command(name="list", description="Список бойцов")
-async def list_users(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Нет прав.", ephemeral=True)
-        return
-
-    cursor.execute("SELECT rp_name, game_nick, service FROM users ORDER BY service DESC")
-    rows = cursor.fetchall()
-
-    embed = discord.Embed(title="Реестр РККА")
-
-    if not rows:
-        embed.description = "Пусто."
-    else:
-        text = ""
-        for i, row in enumerate(rows[:25], start=1):
-            text += f"{i}. {row[0]} | {row[1]} | Выслуга: {row[2]}\\n"
-        embed.description = text
-
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="addservice", description="Добавить выслугу")
-@app_commands.default_permissions(administrator=True)
-async def addservice(interaction: discord.Interaction, member: discord.Member, amount: int):
-    user = get_user(member.id)
-    if not user:
-        await interaction.response.send_message("Игрок не зарегистрирован.", ephemeral=True)
-        return
-
-    cursor.execute(
-        "UPDATE users SET service = service + ? WHERE user_id=?",
-        (amount, member.id)
-    )
-    conn.commit()
-
-    await interaction.response.send_message(f"Добавлено {amount} выслуги.")
-
-@bot.tree.command(name="removeservice", description="Снять выслугу")
-@app_commands.default_permissions(administrator=True)
-async def removeservice(interaction: discord.Interaction, member: discord.Member, amount: int):
-    user = get_user(member.id)
-    if not user:
-        await interaction.response.send_message("Игрок не зарегистрирован.", ephemeral=True)
-        return
-
-    new_service = max(0, user[4] - amount)
-
-    cursor.execute(
-        "UPDATE users SET service=? WHERE user_id=?",
-        (new_service, member.id)
-    )
-    conn.commit()
-
-    await interaction.response.send_message(f"Снято {amount} выслуги.")
-
-bot.run(TOKEN)
+if __name__ == "__main__":
+    asyncio.run(main())
