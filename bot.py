@@ -1,16 +1,16 @@
-import asyncio
-import logging
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message
-from aiogram.filters import Command, CommandObject
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
+import discord
+from discord.ext import commands
+from discord import app_commands
+import sqlite3, time, os, asyncio
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import uvicorn
 
-# ================= НАСТРОЙКИ =================
-BOT_TOKEN = "ТВОЙ_ТОКЕН_БОТА"
-ADMIN_IDS = [123456789, 987654321]  # Впиши сюда Telegram ID администраторов/лидеров
+TOKEN = os.getenv("DISCORD_TOKEN")
+# ВПИШИ СЮДА ID КАНАЛА ДЛЯ ЗАЯВОК
+ADMIN_CHANNEL_ID = 1234567890123456789  
 
-# Справочник рангов РККА
+# --- РАНГИ РККА ---
 RANKS = {
     1: "Красноармеец",
     2: "Ефрейтор",
@@ -24,136 +24,127 @@ RANKS = {
     10: "Генерал-армии"
 }
 
-# Машина состояний для заявки на повышение
-class PromotionForm(StatesGroup):
-    rp_name = State()
-    game_nickname = State()
-    current_rank = State()
-    desired_rank = State()
-    proofs = State()
+# --- НАСТРОЙКА DISCORD БОТА ---
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-router = Router()
+# --- НАСТРОЙКА FASTAPI (API) ---
+app = FastAPI(title="RKKA Bot API")
 
-# ================= КОМАНДЫ АДМИНИСТРАТОРОВ =================
+def get_db():
+    conn = sqlite3.connect("rkka.db")
+    return conn
 
-@router.message(Command("add_visluga"))
-async def add_visluga_command(message: Message, command: CommandObject):
-    """Команда для выдачи выслуги. Формат: /add_visluga [ID_игрока] [Кол-во часов/дней]"""
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("⛔ У вас нет прав для использования этой команды.")
+# Инициализация БД
+conn = get_db()
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users(
+    user_id INTEGER PRIMARY KEY,
+    discord_name TEXT,
+    rp_name TEXT,
+    game_nick TEXT,
+    service INTEGER DEFAULT 0,
+    last_up INTEGER DEFAULT 0
+)
+""")
+conn.commit()
+conn.close()
+
+def get_user_db(uid):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE user_id=?", (uid,))
+    user = cursor.fetchone()
+    conn.close()
+    return user
+
+def get_interaction_roles_str(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.user:
+        return "Не на сервере"
+    member = interaction.user
+    roles = [role.name for role in member.roles if role.name != "@everyone"]
+    if not roles:
+        return "Нет ролей"
+    return member.top_role.name
+
+
+# ================= КОМАНДЫ БОТА =================
+
+@bot.tree.command(name="add_visluga", description="[АДМИН] Выдать выслугу игроку")
+@app_commands.describe(user="Выберите пользователя", amount="Сколько часов/дней выслуги выдать?")
+@app_commands.default_permissions(administrator=True)
+async def add_visluga(interaction: discord.Interaction, user: discord.Member, amount: int):
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    # Проверяем, есть ли пользователь в базе, если нет - создаем
+    cursor.execute("SELECT * FROM users WHERE user_id=?", (user.id,))
+    if not cursor.fetchone():
+        cursor.execute("INSERT INTO users (user_id, discord_name, service) VALUES (?, ?, ?)", 
+                       (user.id, user.name, amount))
+    else:
+        cursor.execute("UPDATE users SET service = service + ? WHERE user_id=?", (amount, user.id))
+        
+    conn.commit()
+    conn.close()
+    
+    await interaction.response.send_message(f"✅ Вы успешно добавили **{amount}** к выслуге игрока {user.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="promote", description="Оставить заявку на повышение в РККА")
+@app_commands.describe(
+    rp_name="Ваше РП Имя (например: Иван Иванов)",
+    game_nick="Ваш никнейм в игре (Ivan_Ivanov)",
+    current_rank="Ваш текущий ранг (от 1 до 6)",
+    desired_rank="Ранг, на который хотите повыситься (от 2 до 7)",
+    proof="Скриншот с доказательствами (прикрепите файл)"
+)
+async def promote(interaction: discord.Interaction, rp_name: str, game_nick: str, current_rank: int, desired_rank: int, proof: discord.Attachment):
+    
+    # ПРОВЕРКА НА МАКСИМАЛЬНЫЙ РАНГ (7 ранг - Майор)
+    if current_rank not in range(1, 8) or desired_rank not in range(2, 8):
+        await interaction.response.send_message("❌ Ошибка: Через бота можно подать рапорт максимум на 7 ранг (Майор). Высшее командование назначается иначе.", ephemeral=True)
+        return
+        
+    # Защита: нельзя подать заявку на ранг, который ниже или равен текущему
+    if desired_rank <= current_rank:
+        await interaction.response.send_message("❌ Ошибка: Желаемый ранг должен быть ВЫШЕ вашего текущего.", ephemeral=True)
+        return
+        
+    # Формируем красивую заявку (Embed)
+    embed = discord.Embed(title="🚨 Новая заявка на повышение 🚨", color=discord.Color.red())
+    embed.add_field(name="Отправитель", value=interaction.user.mention, inline=False)
+    embed.add_field(name="🎭 РП Имя", value=rp_name, inline=True)
+    embed.add_field(name="🎮 Игровой Ник", value=game_nick, inline=True)
+    embed.add_field(name="➖ Текущий ранг", value=f"{current_rank} — {RANKS[current_rank]}", inline=False)
+    embed.add_field(name="➕ Желаемый ранг", value=f"{desired_rank} — {RANKS[desired_rank]}", inline=False)
+    
+    # Проверка скриншота
+    if proof.content_type and proof.content_type.startswith("image/"):
+        embed.set_image(url=proof.url)
+    else:
+        await interaction.response.send_message("❌ Пожалуйста, прикрепите картинку (скриншот).", ephemeral=True)
         return
 
-    # Проверка правильности аргументов
-    if not command.args:
-        await message.answer("⚠️ Использование: `/add_visluga <ID_игрока> <значение>`", parse_mode="Markdown")
-        return
-
-    args = command.args.split()
-    if len(args) < 2:
-        await message.answer("⚠️ Ошибка. Укажите ID игрока и значение выслуги.")
-        return
-
-    player_id = args[0]
-    visluga_value = args[1]
-
-    # ТУТ ДОЛЖНА БЫТЬ ЛОГИКА ТВОЕЙ БАЗЫ ДАННЫХ (SQLite, MySQL, PostgreSQL)
-    # db.update_visluga(player_id, visluga_value)
-
-    await message.answer(f"✅ Вы успешно выдали выслугу ({visluga_value}) игроку с ID {player_id}.")
-
-# ================= СИСТЕМА ПОВЫШЕНИЙ =================
-
-@router.message(Command("promote_request"))
-async def start_promotion_request(message: Message, state: FSMContext):
-    """Начало подачи заявки на повышение"""
-    await message.answer("📝 Начинаем оформление заявки на повышение.\n\nВведите ваше **РП Имя** (например, Иван Иванов):", parse_mode="Markdown")
-    await state.set_state(PromotionForm.rp_name)
-
-@router.message(PromotionForm.rp_name)
-async def process_rp_name(message: Message, state: FSMContext):
-    await state.update_data(rp_name=message.text)
-    await message.answer("👤 Теперь введите ваш **Никнейм в игре** (например, Ivan_Ivanov):", parse_mode="Markdown")
-    await state.set_state(PromotionForm.game_nickname)
-
-@router.message(PromotionForm.game_nickname)
-async def process_game_nickname(message: Message, state: FSMContext):
-    await state.update_data(game_nickname=message.text)
-    
-    # Формируем список рангов для подсказки
-    ranks_text = "\n".join([f"{num} - {name}" for num, name in RANKS.items()])
-    await message.answer(f"🎖 Укажите ваш **ТЕКУЩИЙ ранг** (цифрой от 1 до 9):\n\nДоступные ранги:\n{ranks_text}", parse_mode="Markdown")
-    await state.set_state(PromotionForm.current_rank)
-
-@router.message(PromotionForm.current_rank)
-async def process_current_rank(message: Message, state: FSMContext):
-    if not message.text.isdigit() or int(message.text) not in RANKS:
-        await message.answer("⚠️ Пожалуйста, введите корректный номер ранга (цифру).")
-        return
-    
-    await state.update_data(current_rank=int(message.text))
-    await message.answer("🎯 Укажите ранг, **НА КОТОРЫЙ вы хотите повыситься** (цифрой):", parse_mode="Markdown")
-    await state.set_state(PromotionForm.desired_rank)
-
-@router.message(PromotionForm.desired_rank)
-async def process_desired_rank(message: Message, state: FSMContext):
-    if not message.text.isdigit() or int(message.text) not in RANKS:
-        await message.answer("⚠️ Пожалуйста, введите корректный номер ранга (цифру).")
-        return
-    
-    await state.update_data(desired_rank=int(message.text))
-    await message.answer("📸 Отлично! Теперь **отправьте скриншот** (доказательства работы) в этот чат.\n\n*Если скриншотов несколько, объедините их в коллаж или отправьте ссылку на Imgur/Япикс текстом.*", parse_mode="Markdown")
-    await state.set_state(PromotionForm.proofs)
-
-@router.message(PromotionForm.proofs, F.photo | F.text)
-async def process_proofs(message: Message, state: FSMContext, bot: Bot):
-    user_data = await state.get_data()
-    
-    # Сбор данных
-    rp_name = user_data['rp_name']
-    game_nickname = user_data['game_nickname']
-    current_rank_num = user_data['current_rank']
-    desired_rank_num = user_data['desired_rank']
-    
-    current_rank_name = RANKS[current_rank_num]
-    desired_rank_name = RANKS[desired_rank_num]
-
-    # Формируем текст заявки
-    report_text = (
-        f"🚨 **НОВАЯ ЗАЯВКА НА ПОВЫШЕНИЕ** 🚨\n\n"
-        f"👤 **Отправитель:** {message.from_user.full_name} (@{message.from_user.username})\n"
-        f"🎭 **РП Имя:** {rp_name}\n"
-        f"🎮 **Игровой Ник:** {game_nickname}\n"
-        f"➖ **Текущий ранг:** {current_rank_num} ({current_rank_name})\n"
-        f"➕ **Желаемый ранг:** {desired_rank_num} ({desired_rank_name})\n"
-    )
-
-    # Отправляем заявку всем администраторам
-    for admin_id in ADMIN_IDS:
-        try:
-            if message.photo:
-                # Если отправили фото, пересылаем фото с подписью
-                photo_id = message.photo[-1].file_id
-                await bot.send_photo(chat_id=admin_id, photo=photo_id, caption=report_text, parse_mode="Markdown")
-            else:
-                # Если отправили ссылку (текстом)
-                report_text += f"\n🔗 **Доказательства:** {message.text}"
-                await bot.send_message(chat_id=admin_id, text=report_text, parse_mode="Markdown")
-        except Exception as e:
-            logging.error(f"Не удалось отправить сообщение админу {admin_id}: {e}")
-
-    await message.answer("✅ Ваша заявка успешно отправлена Высшему командованию! Ожидайте проверки.")
-    await state.clear()
+    # Отправка заявки в специальный канал
+    admin_channel = bot.get_channel(ADMIN_CHANNEL_ID)
+    if admin_channel:
+        await admin_channel.send(embed=embed)
+        await interaction.response.send_message("✅ Ваша заявка успешно отправлена Высшему командованию!", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ Ошибка: Не настроен канал для отправки заявок. Проверьте ADMIN_CHANNEL_ID.", ephemeral=True)
 
 
-# ================= ЗАПУСК БОТА =================
-async def main():
-    logging.basicConfig(level=logging.INFO)
-    bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher()
-    dp.include_router(router)
-    
-    print("Бот РККА успешно запущен!")
-    await dp.start_polling(bot)
+# ================= СОБЫТИЯ И ЗАПУСК =================
+
+@bot.event
+async def on_ready():
+    await bot.tree.sync()
+    print(f"Бот {bot.user} успешно запущен и готов к работе!")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if TOKEN:
+        bot.run(TOKEN)
+    else:
+        print("ОШИБКА: Токен Discord не найден (проверьте os.getenv('DISCORD_TOKEN')).")
