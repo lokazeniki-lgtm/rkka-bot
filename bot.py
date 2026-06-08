@@ -1,170 +1,159 @@
-import discord
-from discord.ext import commands
-from discord import app_commands
-import sqlite3, time, os, asyncio
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import uvicorn
+import asyncio
+import logging
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.types import Message
+from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+# ================= НАСТРОЙКИ =================
+BOT_TOKEN = "ТВОЙ_ТОКЕН_БОТА"
+ADMIN_IDS = [123456789, 987654321]  # Впиши сюда Telegram ID администраторов/лидеров
 
-# --- НАСТРОЙКА DISCORD БОТА ---
-# Используем полностью стандартные интенты БЕЗ привилегированных прав.
-# Это на 100% уберет ошибку PrivilegedIntentsRequired!
-intents = discord.Intents.default()
+# Справочник рангов РККА
+RANKS = {
+    1: "Красноармеец",
+    2: "Ефрейтор",
+    3: "Сержант",
+    4: "Старшина",
+    5: "Лейтенант",
+    6: "Капитан",
+    7: "Майор",
+    8: "Полковник",
+    9: "Подполковник",
+    10: "Генерал-армии"
+}
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+# Машина состояний для заявки на повышение
+class PromotionForm(StatesGroup):
+    rp_name = State()
+    game_nickname = State()
+    current_rank = State()
+    desired_rank = State()
+    proofs = State()
 
-# --- НАСТРОЙКА FASTAPI (API) ---
-app = FastAPI(title="RKKA Bot API")
+router = Router()
 
-def get_db():
-    conn = sqlite3.connect("rkka.db")
-    return conn
+# ================= КОМАНДЫ АДМИНИСТРАТОРОВ =================
 
-# Инициализация БД
-conn = get_db()
-cursor = conn.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users(
-    user_id INTEGER PRIMARY KEY,
-    discord_name TEXT,
-    rp_name TEXT,
-    game_nick TEXT,
-    service INTEGER DEFAULT 0,
-    last_up INTEGER DEFAULT 0
-)
-""")
-conn.commit()
-conn.close()
-
-def get_user_db(uid):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE user_id=?", (uid,))
-    user = cursor.fetchone()
-    conn.close()
-    return user
-
-# Функция для безопасного получения роли из взаимодействия (Interaction)
-def get_interaction_roles_str(interaction: discord.Interaction):
-    # Проверяем, что команда вызвана на сервере, а не в ЛС
-    if not interaction.guild or not interaction.user:
-        return "Не на сервере"
-    
-    # Так как при вызове слэш-команды Дискорд сам передает нам объект пользователя со всеми его ролями,
-    # мы можем прочитать их напрямую из interaction.user без включения Members Intent!
-    member = interaction.user
-    
-    # Фильтруем роль @everyone
-    roles = [role.name for role in member.roles if role.name != "@everyone"]
-    
-    if not roles:
-        return "Нет ролей"
-    
-    # Показываем самую высокую по иерархии роль
-    return member.top_role.name
-
-
-# --- МАРШРУТЫ API (ENDPOINTS) ---
-
-@app.get("/")
-def read_root():
-    return {"status": "online", "message": "RKKA API работает"}
-
-
-# --- КОМАНДЫ ДИСКОРД БОТА ---
-
-@bot.event
-async def on_ready():
-    await bot.tree.sync()
-    print(f"Logged in as {bot.user}")
-
-@bot.tree.command(name="reg", description="Регистрация")
-async def reg(interaction: discord.Interaction, rp_name: str, game_nick: str):
-    if get_user_db(interaction.user.id):
-        await interaction.response.send_message("Вы уже зарегистрированы.", ephemeral=True)
+@router.message(Command("add_visluga"))
+async def add_visluga_command(message: Message, command: CommandObject):
+    """Команда для выдачи выслуги. Формат: /add_visluga [ID_игрока] [Кол-во часов/дней]"""
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ У вас нет прав для использования этой команды.")
         return
 
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO users(user_id,discord_name,rp_name,game_nick) VALUES(?,?,?,?)",
-        (interaction.user.id, str(interaction.user), rp_name, game_nick)
-    )
-    conn.commit()
-    conn.close()
-
-    embed = discord.Embed(title="Регистрация завершена")
-    embed.add_field(name="RP Имя", value=rp_name, inline=False)
-    embed.add_field(name="Игровой ник", value=game_nick, inline=False)
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="stats", description="Статистика")
-async def stats(interaction: discord.Interaction):
-    user = get_user_db(interaction.user.id)
-    if not user:
-        await interaction.response.send_message("Сначала используйте /reg", ephemeral=True)
+    # Проверка правильности аргументов
+    if not command.args:
+        await message.answer("⚠️ Использование: `/add_visluga <ID_игрока> <значение>`", parse_mode="Markdown")
         return
 
-    embed = discord.Embed(title="Личное дело")
-    embed.set_thumbnail(url=interaction.user.display_avatar.url)
-    embed.add_field(name="RP Имя", value=user[2], inline=False)
-    embed.add_field(name="Игровой ник", value=user[3], inline=False)
-    embed.add_field(name="Выслуга", value=str(user[4]), inline=True)
+    args = command.args.split()
+    if len(args) < 2:
+        await message.answer("⚠️ Ошибка. Укажите ID игрока и значение выслуги.")
+        return
+
+    player_id = args[0]
+    visluga_value = args[1]
+
+    # ТУТ ДОЛЖНА БЫТЬ ЛОГИКА ТВОЕЙ БАЗЫ ДАННЫХ (SQLite, MySQL, PostgreSQL)
+    # db.update_visluga(player_id, visluga_value)
+
+    await message.answer(f"✅ Вы успешно выдали выслугу ({visluga_value}) игроку с ID {player_id}.")
+
+# ================= СИСТЕМА ПОВЫШЕНИЙ =================
+
+@router.message(Command("promote_request"))
+async def start_promotion_request(message: Message, state: FSMContext):
+    """Начало подачи заявки на повышение"""
+    await message.answer("📝 Начинаем оформление заявки на повышение.\n\nВведите ваше **РП Имя** (например, Иван Иванов):", parse_mode="Markdown")
+    await state.set_state(PromotionForm.rp_name)
+
+@router.message(PromotionForm.rp_name)
+async def process_rp_name(message: Message, state: FSMContext):
+    await state.update_data(rp_name=message.text)
+    await message.answer("👤 Теперь введите ваш **Никнейм в игре** (например, Ivan_Ivanov):", parse_mode="Markdown")
+    await state.set_state(PromotionForm.game_nickname)
+
+@router.message(PromotionForm.game_nickname)
+async def process_game_nickname(message: Message, state: FSMContext):
+    await state.update_data(game_nickname=message.text)
     
-    # Извлекаем роль прямо из контекста команды
-    current_role = get_interaction_roles_str(interaction)
-    embed.add_field(name="Звание (Роль)", value=current_role, inline=True)
+    # Формируем список рангов для подсказки
+    ranks_text = "\n".join([f"{num} - {name}" for num, name in RANKS.items()])
+    await message.answer(f"🎖 Укажите ваш **ТЕКУЩИЙ ранг** (цифрой от 1 до 9):\n\nДоступные ранги:\n{ranks_text}", parse_mode="Markdown")
+    await state.set_state(PromotionForm.current_rank)
+
+@router.message(PromotionForm.current_rank)
+async def process_current_rank(message: Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) not in RANKS:
+        await message.answer("⚠️ Пожалуйста, введите корректный номер ранга (цифру).")
+        return
     
-    await interaction.response.send_message(embed=embed)
+    await state.update_data(current_rank=int(message.text))
+    await message.answer("🎯 Укажите ранг, **НА КОТОРЫЙ вы хотите повыситься** (цифрой):", parse_mode="Markdown")
+    await state.set_state(PromotionForm.desired_rank)
 
-@bot.tree.command(name="up", description="Получить 1 очко выслуги")
-async def up(interaction: discord.Interaction):
-    user = get_user_db(interaction.user.id)
-    if not user:
-        await interaction.response.send_message("Сначала используйте /reg", ephemeral=True)
+@router.message(PromotionForm.desired_rank)
+async def process_desired_rank(message: Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) not in RANKS:
+        await message.answer("⚠️ Пожалуйста, введите корректный номер ранга (цифру).")
         return
+    
+    await state.update_data(desired_rank=int(message.text))
+    await message.answer("📸 Отлично! Теперь **отправьте скриншот** (доказательства работы) в этот чат.\n\n*Если скриншотов несколько, объедините их в коллаж или отправьте ссылку на Imgur/Япикс текстом.*", parse_mode="Markdown")
+    await state.set_state(PromotionForm.proofs)
 
-    now = int(time.time())
-    last_up = user[5]
-    cooldown = 43200
+@router.message(PromotionForm.proofs, F.photo | F.text)
+async def process_proofs(message: Message, state: FSMContext, bot: Bot):
+    user_data = await state.get_data()
+    
+    # Сбор данных
+    rp_name = user_data['rp_name']
+    game_nickname = user_data['game_nickname']
+    current_rank_num = user_data['current_rank']
+    desired_rank_num = user_data['desired_rank']
+    
+    current_rank_name = RANKS[current_rank_num]
+    desired_rank_name = RANKS[desired_rank_num]
 
-    if now - last_up < cooldown:
-        left = cooldown - (now - last_up)
-        h = left // 3600
-        m = (left % 3600) // 60
-        await interaction.response.send_message(
-            f"Следующая выслуга через {h}ч {m}м",
-            ephemeral=True
-        )
-        return
-
-    service = user[4] + 1
-
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE users SET service=?, last_up=? WHERE user_id=?",
-        (service, now, interaction.user.id)
-    )
-    conn.commit()
-    conn.close()
-
-    await interaction.response.send_message(
-        f"Вы получили 1 очко выслуги. Всего: {service}"
+    # Формируем текст заявки
+    report_text = (
+        f"🚨 **НОВАЯ ЗАЯВКА НА ПОВЫШЕНИЕ** 🚨\n\n"
+        f"👤 **Отправитель:** {message.from_user.full_name} (@{message.from_user.username})\n"
+        f"🎭 **РП Имя:** {rp_name}\n"
+        f"🎮 **Игровой Ник:** {game_nickname}\n"
+        f"➖ **Текущий ранг:** {current_rank_num} ({current_rank_name})\n"
+        f"➕ **Желаемый ранг:** {desired_rank_num} ({desired_rank_name})\n"
     )
 
-# --- ЗАПУСК БОТА И API ОДНОВРЕМЕННО ---
+    # Отправляем заявку всем администраторам
+    for admin_id in ADMIN_IDS:
+        try:
+            if message.photo:
+                # Если отправили фото, пересылаем фото с подписью
+                photo_id = message.photo[-1].file_id
+                await bot.send_photo(chat_id=admin_id, photo=photo_id, caption=report_text, parse_mode="Markdown")
+            else:
+                # Если отправили ссылку (текстом)
+                report_text += f"\n🔗 **Доказательства:** {message.text}"
+                await bot.send_message(chat_id=admin_id, text=report_text, parse_mode="Markdown")
+        except Exception as e:
+            logging.error(f"Не удалось отправить сообщение админу {admin_id}: {e}")
+
+    await message.answer("✅ Ваша заявка успешно отправлена Высшему командованию! Ожидайте проверки.")
+    await state.clear()
+
+
+# ================= ЗАПУСК БОТА =================
 async def main():
-    port = int(os.getenv("PORT", 8080))
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
-    server = uvicorn.Server(config)
+    logging.basicConfig(level=logging.INFO)
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
     
-    await asyncio.gather(
-        server.serve(),
-        bot.start(TOKEN)
-    )
+    print("Бот РККА успешно запущен!")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
